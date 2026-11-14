@@ -13,40 +13,47 @@ import kotlin.math.sqrt
 /**
  * Locates the black aiming mark on a Krüger airgun target.
  *
- * Candidates come from dark connected components; each is scored by
- * interior/exterior contrast, then refined with radial dark→light edges.
+ * Tries several dark thresholds (shadow-robust), keeps candidates whose
+ * radius is in a plausible fraction of the image, scores by rim contrast,
+ * then refines with radial dark→light edges.
  */
 object TargetCalibrator {
 
     fun calibrate(image: ImageBuffer): TargetCalibration? {
         val w = image.width
         val h = image.height
-        val threshold = estimateDarkThreshold(image)
-        val mask = BooleanArray(w * h)
-        for (i in image.gray.indices) {
-            mask[i] = image.gray[i] < threshold
-        }
-
-        val components = connectedComponents(mask, w, h)
-        if (components.isEmpty()) return null
-
+        val minDim = min(w, h).toFloat()
+        val minR = minDim * 0.14f
+        val maxR = minDim * 0.40f
         val cxImg = w / 2f
         val cyImg = h / 2f
+
         data class Cand(val score: Float, val cx: Float, val cy: Float, val r: Float)
 
         val cands = ArrayList<Cand>()
-        for (comp in components) {
-            if (comp.area !in (w * h / 16)..(w * h * 7 / 10)) continue
-            val circularity = circularity(comp)
-            if (circularity < 0.55f) continue
-            val q = circleQuality(image, comp.cx, comp.cy, comp.radius) + circularity * 15f
-            val centerPen = 0.015f * hypot(comp.cx - cxImg, comp.cy - cyImg)
-            cands.add(Cand(q - centerPen, comp.cx, comp.cy, comp.radius))
+        for (pct in intArrayOf(18, 25, 32)) {
+            val thr = percentileThreshold(image, pct / 100f) + 10f
+            val mask = BooleanArray(w * h)
+            for (i in image.gray.indices) {
+                mask[i] = image.gray[i] < thr.coerceIn(15f, 100f)
+            }
+            // light open/close via box morph
+            val closed = Morphology.closeBoolFast(mask, w, h, 3)
+            val opened = Morphology.openBoolFast(closed, w, h, 2)
+            for (comp in connectedComponents(opened, w, h)) {
+                if (comp.area < w * h * 0.045f) continue
+                val circ = circularity(comp)
+                if (circ < 0.58f) continue
+                // Use bounding-box equivalent radius (more stable than area radius)
+                val rBox = 0.25f * ((comp.maxX - comp.minX + 1) + (comp.maxY - comp.minY + 1))
+                if (rBox !in minR..maxR) continue
+                val q = circleQuality(image, comp.cx, comp.cy, rBox)
+                if (q < 16f) continue
+                val centerPen = 0.02f * hypot(comp.cx - cxImg, comp.cy - cyImg)
+                cands.add(Cand(q + circ * 20f - centerPen, comp.cx, comp.cy, rBox))
+            }
         }
-        if (cands.isEmpty()) {
-            val largest = components.maxByOrNull { it.area } ?: return null
-            cands.add(Cand(0f, largest.cx, largest.cy, largest.radius))
-        }
+        if (cands.isEmpty()) return null
         cands.sortByDescending { it.score }
         var cx = cands[0].cx
         var cy = cands[0].cy
@@ -72,8 +79,25 @@ object TargetCalibrator {
             }
         }
 
-        if (r < min(w, h) * 0.12f) return null
+        if (r !in minR..maxR) return null
         return TargetCalibration(cx, cy, r, w, h)
+    }
+
+    private fun percentileThreshold(image: ImageBuffer, pct: Float): Float {
+        val hist = IntArray(256)
+        var i = 0
+        while (i < image.gray.size) {
+            hist[image.gray[i].roundToInt().coerceIn(0, 255)]++
+            i += 3
+        }
+        val total = hist.sum().coerceAtLeast(1)
+        val target = (total * pct).toInt()
+        var cum = 0
+        for (t in 0..255) {
+            cum += hist[t]
+            if (cum >= target) return t.toFloat()
+        }
+        return 40f
     }
 
     private fun circleQuality(image: ImageBuffer, cx: Float, cy: Float, r: Float): Float {
@@ -89,11 +113,11 @@ object TargetCalibrator {
             while (x < image.width) {
                 val d = hypot(x - cx, y - cy)
                 val v = image.get(x, y)
-                if (d <= r * 0.82f) {
+                if (d <= r * 0.70f) {
                     inSum += v
                     inN++
                     if (v < 70f) darkN++
-                } else if (d in (r * 1.04f)..(r * 1.22f)) {
+                } else if (d in (r * 1.05f)..(r * 1.22f)) {
                     outSum += v
                     outN++
                 }
@@ -103,51 +127,10 @@ object TargetCalibrator {
         }
         if (inN < 40 || outN < 20) return -1e6f
         val contrast = (outSum / outN - inSum / inN).toFloat()
+        if (contrast < 16f) return -1e6f
+        if (inSum / inN > 95.0) return -1e6f
         val darkFrac = darkN.toFloat() / inN
-        return contrast + 40f * darkFrac
-    }
-
-    private fun estimateDarkThreshold(image: ImageBuffer): Float {
-        val hist = IntArray(256)
-        var i = 0
-        while (i < image.gray.size) {
-            hist[image.gray[i].roundToInt().coerceIn(0, 255)]++
-            i += 4
-        }
-        val total = hist.sum().coerceAtLeast(1)
-        var sum = 0.0
-        for (g in hist.indices) sum += g * hist[g].toDouble()
-        var sumB = 0.0
-        var wB = 0
-        var maxVar = -1.0
-        var threshold = 80
-        for (t in 0..255) {
-            wB += hist[t]
-            if (wB == 0) continue
-            val wF = total - wB
-            if (wF == 0) break
-            sumB += t * hist[t].toDouble()
-            val mB = sumB / wB
-            val mF = (sum - sumB) / wF
-            val between = wB.toDouble() * wF * (mB - mF) * (mB - mF)
-            if (between > maxVar) {
-                maxVar = between
-                threshold = t
-            }
-        }
-        // Also consider low percentile — close-ups are mostly black ink.
-        var cum = 0
-        var p28 = 40
-        val target = (total * 0.28).toInt()
-        for (t in 0..255) {
-            cum += hist[t]
-            if (cum >= target) {
-                p28 = t
-                break
-            }
-        }
-        val thr = min(threshold + 4, p28 + 8)
-        return thr.coerceIn(28, 95).toFloat()
+        return contrast + 30f * darkFrac
     }
 
     private data class Component(
@@ -245,36 +228,40 @@ object TargetCalibrator {
         cy: Float,
         seedR: Float
     ): List<Pair<Float, Float>> {
-        val points = ArrayList<Pair<Float, Float>>(180)
-        val searchMin = (seedR * 0.55f).coerceAtLeast(6f)
-        val searchMax = (seedR * 1.45f).coerceAtMost(
-            min(
-                min(cx, image.width - cx),
-                min(cy, image.height - cy)
-            ) - 2f
+        val points = ArrayList<Pair<Float, Float>>(96)
+        val searchMin = (seedR * 0.70f).coerceAtLeast(6f)
+        val searchMax = (seedR * 1.25f).coerceAtMost(
+            min(min(cx, image.width - cx), min(cy, image.height - cy)) - 2f
         )
         if (searchMax <= searchMin) return points
-        for (i in 0 until 180) {
-            val angle = (Math.PI * 2.0 * i / 180).toFloat()
+        for (i in 0 until 96) {
+            val angle = (Math.PI * 2.0 * i / 96).toFloat()
             val c = cos(angle)
             val s = sin(angle)
-            var bestT = seedR
-            var bestGrad = 0f
-            var t = searchMin
-            var prev = sampleBilinear(image, cx + c * t, cy + s * t)
-            t += 0.7f
-            while (t <= searchMax) {
-                val v = sampleBilinear(image, cx + c * t, cy + s * t)
-                val grad = v - prev
-                if (grad > bestGrad) {
-                    bestGrad = grad
-                    bestT = t - 0.35f
+            var found: Float? = null
+            var f = 0.72f
+            while (f <= 1.22f) {
+                val rr = seedR * f
+                val xi = cx + c * rr
+                val yi = cy + s * rr
+                val xj = cx + c * rr * 0.90f
+                val yj = cy + s * rr * 0.90f
+                if (xi < 1 || yi < 1 || xi >= image.width - 1 || yi >= image.height - 1) {
+                    f += 0.02f
+                    continue
                 }
-                prev = v
-                t += 0.7f
+                if (xj < 1 || yj < 1 || xj >= image.width - 1 || yj >= image.height - 1) {
+                    f += 0.02f
+                    continue
+                }
+                if (sampleBilinear(image, xi, yi) - sampleBilinear(image, xj, yj) > 12f) {
+                    found = rr
+                    break
+                }
+                f += 0.02f
             }
-            if (bestGrad > 3f) {
-                points.add(cx + c * bestT to cy + s * bestT)
+            if (found != null && found in searchMin..searchMax) {
+                points.add(cx + c * found to cy + s * found)
             }
         }
         return points

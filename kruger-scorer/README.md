@@ -46,14 +46,14 @@ cd kruger-scorer
 
 ## Reconocimiento (fotos reales)
 
-Pipeline por **superposición de plantilla** (mismas dianas Krüger):
+Pipeline por **marco canónico + aplanado de iluminación** (mismas dianas Krüger):
 
-1. Calibrar el círculo negro y warp a un marco canónico (negro = radio fijo).
-2. Comparar con un disco negro ideal → residuales = huecos / diferencias.
-3. Filtrar ruido; cierre morfológico para completar círculos rotos; distance transform para separar clusters.
+1. Calibrar el círculo negro (varios umbrales, radio acotado) y warp a un marco canónico.
+2. Aplanar sombras dentro del negro (`gray / blur`) y combinar residual + chroma (cian/azul del fondo).
+3. Cierre morfológico para completar círculos rotos; DT + semillas para separar clusters; validación por cobertura.
 4. Puntuar en el marco canónico (ISSF 10 m aire) y proyectar al overlay.
 
-Afinado con un lote de fotos de móvil; holdout aparte. El umbral y los taps manuales siguen siendo la red de seguridad.
+Afinado con un lote de fotos de móvil (≈±1 impacto en train, holdout OK). El umbral y los taps manuales siguen siendo la red de seguridad.
 
 ## Arquitectura
 

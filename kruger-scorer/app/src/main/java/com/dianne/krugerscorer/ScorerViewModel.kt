@@ -21,7 +21,7 @@ import kotlinx.coroutines.withContext
 data class UiState(
     val bitmap: Bitmap? = null,
     val result: AnalysisResult? = null,
-    val sensitivity: Float = 0.55f,
+    val sensitivity: Float = 0.48f,
     val analyzing: Boolean = false,
     val error: String? = null
 )

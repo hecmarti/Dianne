@@ -9,7 +9,6 @@ import com.dianne.krugerscorer.model.AnalysisResult
 import com.dianne.krugerscorer.model.ShotDetection
 import com.dianne.krugerscorer.model.TargetCalibration
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -17,64 +16,55 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
- * Template-superposition scoring:
- * 1. Locate black aiming mark
- * 2. Warp photo so the mark becomes a fixed circle in a canonical frame
- * 3. Compare against an ideal black disk → residuals = holes
- * 4. Morph-close incomplete circles, split merged blobs, score in canonical space
- * 5. Map detections back to the working bitmap for the UI overlay
+ * Template / canonical-frame scorer (v6):
+ * 1. Calibrate black mark → warp so it becomes a fixed circle
+ * 2. Flatten illumination inside the black disk
+ * 3. Score hole likelihood (flat residual + chroma backstop + bright)
+ * 4. Morph-close incomplete circles, DT-split clusters, seed leftovers
+ * 5. Validate each circle, map back to working-image coords
  */
 object TemplatePipeline {
 
-    const val CANON = 512
-    const val BLACK_R = 150f
+    const val CANON = 640
+    const val BLACK_R = 200f
+    /** Expected pellet radius in canonical px (~0.15 × black radius). */
+    val PELLET_R: Float = BLACK_R * 0.15f
+
+    private val RING_DIAM_MM = floatArrayOf(59.5f, 53.5f, 47.5f, 41.5f, 35.5f, 29.5f, 23.5f, 17.5f, 11.5f, 5.5f)
 
     data class Output(
         val result: AnalysisResult,
-        val workingBitmap: Bitmap,
-        val canonicalPreview: Bitmap? = null
+        val workingBitmap: Bitmap
     )
 
     fun analyze(source: Bitmap, sensitivity: Float): Output {
-        val (_, working) = ImageBuffer.fromBitmap(source, maxSide = 900)
-        val buffer = ImageBuffer.fromBitmap(working, maxSide = 900).first
+        val (_, working) = ImageBuffer.fromBitmap(source, maxSide = 1100)
+        val buffer = ImageBuffer.fromBitmap(working, maxSide = 1100).first
         val cal = TargetCalibrator.calibrate(buffer)
-            ?: return Output(
-                AnalysisResult(null, emptyList(), sensitivity),
-                working
-            )
+            ?: return Output(AnalysisResult(null, emptyList(), sensitivity), working)
 
         val warped = warpToCanonical(working, cal)
-        val template = makeIdealTemplate()
-        val (mask, like, er) = holeMask(warped, template, sensitivity)
-        val detsCanon = extractShots(mask, like, er, sensitivity)
+        val (like, zone, distMap) = likelihood(warped, sensitivity)
+        val detsCanon = extract(like, zone, distMap, sensitivity)
 
-        // Map canonical detections → working-image coordinates
-        val inv = inverseSimilarity(cal, working.width, working.height)
+        val inv = InvMap(BLACK_R / cal.blackRadius, cal.centerX, cal.centerY)
         val detections = detsCanon.mapIndexed { idx, d ->
             val (ox, oy) = inv.map(d.x, d.y)
-            val or = d.r * inv.scale
             ShotDetection(
                 id = idx,
                 x = ox,
                 y = oy,
-                radius = or,
+                radius = d.r * inv.scale,
                 score = d.score,
                 confidence = d.conf
             )
         }
-
-        return Output(
-            result = AnalysisResult(cal, detections, sensitivity),
-            workingBitmap = working,
-            canonicalPreview = warped
-        )
+        // Recenter calibration onto working bitmap (already is)
+        val calWorking = TargetCalibration(cal.centerX, cal.centerY, cal.blackRadius, working.width, working.height)
+        return Output(AnalysisResult(calWorking, detections, sensitivity), working)
     }
 
-    // --- geometry ---
-
-    private data class InvMap(val scale: Float, val cx: Float, val cy: Float, val ox: Float, val oy: Float) {
-        /** Canonical (x,y) → original bitmap */
+    private data class InvMap(val scale: Float, val ox: Float, val oy: Float) {
         fun map(x: Float, y: Float): Pair<Float, Float> {
             val dx = (x - CANON / 2f) / scale
             val dy = (y - CANON / 2f) / scale
@@ -82,15 +72,9 @@ object TemplatePipeline {
         }
     }
 
-    private fun inverseSimilarity(cal: TargetCalibration, w: Int, h: Int): InvMap {
-        val scale = BLACK_R / cal.blackRadius
-        return InvMap(scale, CANON / 2f, CANON / 2f, cal.centerX, cal.centerY)
-    }
-
     private fun warpToCanonical(src: Bitmap, cal: TargetCalibration): Bitmap {
         val scale = BLACK_R / cal.blackRadius
         val matrix = Matrix()
-        // Translate black center to origin, scale, translate to canonical center
         matrix.postTranslate(-cal.centerX, -cal.centerY)
         matrix.postScale(scale, scale)
         matrix.postTranslate(CANON / 2f, CANON / 2f)
@@ -101,180 +85,277 @@ object TemplatePipeline {
         return out
     }
 
-    private fun makeIdealTemplate(): Bitmap {
-        val bmp = Bitmap.createBitmap(CANON, CANON, Bitmap.Config.ARGB_8888)
-        val c = Canvas(bmp)
-        c.drawColor(Color.rgb(215, 218, 222))
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(16, 16, 16)
-            style = Paint.Style.FILL
-        }
-        c.drawCircle(CANON / 2f, CANON / 2f, BLACK_R, paint)
-        return bmp
-    }
+    private data class LikePack(val like: FloatArray, val zone: BooleanArray, val dist: FloatArray)
 
-    // --- hole mask via superposition ---
-
-    private data class MaskPack(val mask: BooleanArray, val like: FloatArray, val er: Float)
-
-    private fun holeMask(warped: Bitmap, template: Bitmap, sens: Float): MaskPack {
+    private fun likelihood(warped: Bitmap, sens: Float): LikePack {
         val s = sens.coerceIn(0f, 1f)
-        val wGray = FloatArray(CANON * CANON)
-        val tGray = FloatArray(CANON * CANON)
-        val chroma = FloatArray(CANON * CANON)
-        val backstop = FloatArray(CANON * CANON)
-        val wp = IntArray(CANON * CANON)
-        val tp = IntArray(CANON * CANON)
-        warped.getPixels(wp, 0, CANON, 0, 0, CANON, CANON)
-        template.getPixels(tp, 0, CANON, 0, 0, CANON, CANON)
-        for (i in wp.indices) {
-            val wr = Color.red(wp[i]); val wg = Color.green(wp[i]); val wb = Color.blue(wp[i])
-            val tr = Color.red(tp[i]); val tg = Color.green(tp[i]); val tb = Color.blue(tp[i])
-            wGray[i] = 0.299f * wr + 0.587f * wg + 0.114f * wb
-            tGray[i] = 0.299f * tr + 0.587f * tg + 0.114f * tb
-            val mx = max(wr, max(wg, wb)).toFloat()
-            val mn = min(wr, min(wg, wb)).toFloat()
-            chroma[i] = mx - mn
-            // rough HSV-ish backstop: cyan/blue or brown
-            val maxc = mx; val minc = mn
-            val delta = maxc - minc
-            var h = 0f
-            if (delta > 1f) {
-                h = when (maxc) {
-                    wr.toFloat() -> 60f * (((wg - wb) / delta) % 6f)
-                    wg.toFloat() -> 60f * ((wb - wr) / delta + 2f)
-                    else -> 60f * ((wr - wg) / delta + 4f)
-                }
-                if (h < 0) h += 360f
-            }
-            val sat = if (maxc > 1f) delta / maxc else 0f
-            val value = maxc
-            val cyan = h in 150f..260f && sat > 0.15f && value > 50f
-            val brown = (h < 40f || h > 320f) && sat > 0.12f && value > 40f
-            backstop[i] = when {
-                cyan -> 60f
-                brown -> 40f
-                else -> 0f
-            }
-        }
-
-        // Ink level inside black zone
-        val inkSamples = ArrayList<Float>()
-        for (y in 0 until CANON) {
-            for (x in 0 until CANON) {
-                val d = hypot(x - CANON / 2f, y - CANON / 2f)
-                if (d <= BLACK_R * 0.95f) {
-                    inkSamples.add(wGray[y * CANON + x])
-                }
-            }
-        }
-        inkSamples.sort()
-        val inkCut = inkSamples[(inkSamples.size * 0.35f).toInt().coerceIn(0, inkSamples.lastIndex)]
-        val darkInk = inkSamples.filter { it <= inkCut }
-        val ink = if (darkInk.isEmpty()) 25f else darkInk[darkInk.size / 2]
-
+        val pixels = IntArray(CANON * CANON)
+        warped.getPixels(pixels, 0, CANON, 0, 0, CANON, CANON)
+        val gray = FloatArray(CANON * CANON)
         val like = FloatArray(CANON * CANON)
-        val vals = ArrayList<Float>()
+        val zone = BooleanArray(CANON * CANON)
+        val dist = FloatArray(CANON * CANON)
+        val cyan = FloatArray(CANON * CANON)
+        val brown = FloatArray(CANON * CANON)
+        val blueDom = FloatArray(CANON * CANON)
+
         for (y in 0 until CANON) {
             for (x in 0 until CANON) {
                 val i = y * CANON + x
+                val p = pixels[i]
+                val r = Color.red(p).toFloat()
+                val g = Color.green(p).toFloat()
+                val b = Color.blue(p).toFloat()
+                gray[i] = 0.299f * r + 0.587f * g + 0.114f * b
                 val d = hypot(x - CANON / 2f, y - CANON / 2f)
-                if (d > BLACK_R * 0.95f) continue
-                if (d >= BLACK_R * 0.90f) continue // rim
-                val bright = max(0f, wGray[i] - (ink + 20f - s * 10f))
-                val diff = max(0f, abs(wGray[i] - tGray[i]) - 30f)
-                val v = 0.35f * bright + 0.20f * chroma[i] + 0.30f * backstop[i] + 0.15f * diff
-                like[i] = v
-                if (v > 3f) vals.add(v)
+                dist[i] = d
+                zone[i] = d <= BLACK_R * 0.88f
+
+                val mx = max(r, max(g, b))
+                val mn = min(r, min(g, b))
+                val delta = mx - mn
+                var h = 0f
+                if (delta > 1f) {
+                    h = when (mx) {
+                        r -> 60f * (((g - b) / delta) % 6f)
+                        g -> 60f * ((b - r) / delta + 2f)
+                        else -> 60f * ((r - g) / delta + 4f)
+                    }
+                    if (h < 0) h += 360f
+                }
+                val sat = if (mx > 1f) delta / mx else 0f
+                val value = mx
+                // OpenCV H is 0-179; we use 0-360 → scale thresholds ×2
+                cyan[i] = if (h in 150f..290f && sat > 0.12f && value > 35f) 1f else 0f
+                brown[i] = if ((h <= 64f || h >= 296f) && sat > 0.12f && value > 30f) 1f else 0f
+                blueDom[i] = max(0f, b - max(r, g) - 5f)
             }
         }
-        val er = max(7f, BLACK_R * 0.075f)
-        if (vals.size < 30) {
-            return MaskPack(BooleanArray(CANON * CANON), like, er)
+
+        // Illumination flatten: gray / large blur
+        val illum = FloatArray(CANON * CANON)
+        gray.blurBox(CANON, CANON, (BLACK_R * 0.22f).roundToInt().coerceAtLeast(8), illum)
+        // Approximate second pass for larger sigma
+        val illum2 = FloatArray(CANON * CANON)
+        illum.blurBox(CANON, CANON, (BLACK_R * 0.18f).roundToInt().coerceAtLeast(6), illum2)
+
+        val ink = FloatArray(CANON * CANON)
+        // Approximate median with two box blurs (good enough for ink estimate)
+        gray.blurBox(CANON, CANON, 20, ink)
+        val ink2 = FloatArray(CANON * CANON)
+        ink.blurBox(CANON, CANON, 20, ink2)
+
+        val flatRes = FloatArray(CANON * CANON)
+        val bright = FloatArray(CANON * CANON)
+        for (i in gray.indices) {
+            val ill = max(illum2[i], 8f)
+            val flat = gray[i] / ill
+            flatRes[i] = max(0f, flat - (1.08f - s * 0.06f)) * 80f
+            bright[i] = max(0f, gray[i] - (ink2[i] + 12f - s * 6f))
         }
-        vals.sort()
-        val keep = 0.012f + s * 0.022f
-        val thr = vals[((vals.size - 1) * (1f - keep)).roundToInt().coerceIn(0, vals.lastIndex)]
-        val floor = max(thr * (0.50f - s * 0.1f), 10f)
-        val raw = BooleanArray(CANON * CANON)
+
+        // DoG on flat residual
+        val g1 = FloatArray(CANON * CANON)
+        val g2 = FloatArray(CANON * CANON)
+        flatRes.blurBox(CANON, CANON, max(2, (PELLET_R * 0.18f).roundToInt()), g1)
+        flatRes.blurBox(CANON, CANON, max(3, (PELLET_R * 0.45f).roundToInt()), g2)
+
         for (i in like.indices) {
-            raw[i] = like[i] >= floor
+            if (!zone[i] || dist[i] >= BLACK_R * 0.87f) {
+                like[i] = 0f
+                continue
+            }
+            val dog = max(0f, g1[i] - g2[i])
+            like[i] = (
+                0.34f * flatRes[i]
+                    + 0.22f * bright[i]
+                    + 0.24f * (70f * cyan[i] + 40f * brown[i])
+                    + 0.10f * blueDom[i]
+                    + 0.10f * dog
+                )
         }
-        // Close incomplete circles (torn paper edges), then open noise.
-        val closeR = max(2, (er * 0.75f).roundToInt())
-        val openR = max(1, (er * 0.28f).roundToInt())
-        var mask = Morphology.closeBoolFast(raw, CANON, CANON, closeR)
-        mask = Morphology.closeBoolFast(mask, CANON, CANON, closeR)
-        mask = Morphology.openBoolFast(mask, CANON, CANON, openR)
-        return MaskPack(mask, like, er)
+        return LikePack(like, zone, dist)
     }
 
     private data class CanonShot(val x: Float, val y: Float, val r: Float, val conf: Float, val score: Int)
 
-    private fun extractShots(
-        mask: BooleanArray,
+    private fun extract(
         like: FloatArray,
-        er: Float,
+        zone: BooleanArray,
+        distMap: FloatArray,
         sens: Float
     ): List<CanonShot> {
         val s = sens.coerceIn(0f, 1f)
+        val er = PELLET_R
+        val vals = ArrayList<Float>()
+        for (i in like.indices) {
+            if (zone[i] && like[i] > 2f) vals.add(like[i])
+        }
+        if (vals.size < 30) return emptyList()
+        vals.sort()
+        val keep = 0.025f + s * 0.035f
+        val thr = vals[((vals.size - 1) * (1f - keep)).roundToInt().coerceIn(0, vals.lastIndex)]
+        val floor = max(thr * (0.38f - s * 0.05f), 7.5f)
+
+        val rawMask = BooleanArray(CANON * CANON)
+        for (i in like.indices) {
+            rawMask[i] = like[i] >= floor && zone[i] && distMap[i] <= BLACK_R * 0.86f
+        }
+        val closeR = max(2, (er * 0.28f).roundToInt())
+        val openR = max(1, (er * 0.14f).roundToInt())
+        var mask = Morphology.closeBoolFast(rawMask, CANON, CANON, closeR)
+        mask = Morphology.closeBoolFast(mask, CANON, CANON, closeR)
+        mask = Morphology.openBoolFast(mask, CANON, CANON, openR)
+        for (i in mask.indices) {
+            if (distMap[i] >= BLACK_R * 0.86f) mask[i] = false
+        }
+
         val holeArea = (PI * er * er).toFloat()
         val comps = connected(mask, like)
-        val dets = ArrayList<CanonShot>()
-        val occupied = BooleanArray(CANON * CANON)
-        val minConf = 0.22f - s * 0.06f
+        val raw = ArrayList<CanonShot>()
 
         for (comp in comps) {
             if (comp.area < holeArea * 0.28f) continue
+            if (hypot(comp.cx - CANON / 2f, comp.cy - CANON / 2f) > BLACK_R * 0.86f) continue
             val peri = 2f * ((comp.maxX - comp.minX + 1) + (comp.maxY - comp.minY + 1)) * 0.85f
             val circ = (4f * PI.toFloat() * comp.area / (peri * peri + 1e-3f)).coerceIn(0f, 1.5f)
-            val conf = (comp.meanLike / 35f).coerceIn(0f, 1f)
-            if (conf < minConf) continue
+            var est = max(1, (comp.area / (holeArea * 1.0f)).roundToInt())
+            val single = est == 1 || (circ > 0.55f && comp.area < holeArea * 1.8f)
 
-            var est = max(1, (comp.area / (holeArea * 1.05f)).roundToInt())
-            val single = est == 1 || (circ > 0.55f && comp.area < holeArea * 1.7f)
             if (single) {
-                val r = sqrt(comp.area / PI.toFloat()).coerceIn(er * 0.45f, er * 1.35f)
-                if (occupiedNear(occupied, comp.cx, comp.cy, er)) continue
-                mark(occupied, comp.cx, comp.cy, r * 0.9f)
-                dets.add(
-                    CanonShot(comp.cx, comp.cy, r, conf, scoreCanon(comp.cx, comp.cy, r))
-                )
-            } else {
-                est = min(est, max(1, (comp.area / (holeArea * 0.95f)).toInt()))
-                val dist = distanceTransform(comp.pixels)
-                val minR = er * 0.40f
-                val peaks = localMaxima(dist, minR, er * 1.4f, er)
-                var taken = 0
-                for ((px, py, peak) in peaks.sortedByDescending { it.third }) {
-                    if (taken >= est) break
-                    if (occupiedNear(occupied, px, py, er)) continue
-                    val r = peak.coerceIn(minR, er * 1.4f)
-                    mark(occupied, px, py, r * 0.9f)
-                    dets.add(CanonShot(px, py, r, conf * 0.85f, scoreCanon(px, py, r)))
+                val r = sqrt(comp.area / PI.toFloat()).coerceIn(er * 0.5f, er * 1.2f)
+                val (ok, conf) = validate(like, comp.cx, comp.cy, r, floor)
+                if (ok) raw.add(CanonShot(comp.cx, comp.cy, r, conf, scoreCanon(comp.cx, comp.cy, r)))
+                continue
+            }
+
+            est = (comp.area / (holeArea * 0.90f)).roundToInt().coerceIn(2, 7)
+            val dt = distanceTransform(comp.pixels)
+            val minR = er * 0.38f
+            val peaks = localMaxima(dt, minR, er * 1.25f, er)
+            var taken = 0
+            val occupied = ArrayList<Pair<Float, Float>>()
+            for ((px, py, peak) in peaks.sortedByDescending { it.third }) {
+                if (taken >= est) break
+                if (occupied.any { (it.first - px) * (it.first - px) + (it.second - py) * (it.second - py) < (er * 0.68f) * (er * 0.68f) }) {
+                    continue
+                }
+                val r = peak.coerceIn(minR, er * 1.25f)
+                val (ok, conf) = validate(like, px, py, r, floor)
+                if (ok) {
+                    occupied.add(px to py)
+                    raw.add(CanonShot(px, py, r, conf, scoreCanon(px, py, r)))
                     taken++
                 }
-                if (taken == 0) {
-                    val r = sqrt(comp.area / PI.toFloat()).coerceIn(er * 0.45f, er * 1.35f)
-                    dets.add(CanonShot(comp.cx, comp.cy, r, conf, scoreCanon(comp.cx, comp.cy, r)))
-                }
+            }
+            if (taken == 0) {
+                val r = sqrt(comp.area / PI.toFloat()).coerceIn(er * 0.5f, er * 1.2f)
+                val (ok, conf) = validate(like, comp.cx, comp.cy, r, floor)
+                if (ok) raw.add(CanonShot(comp.cx, comp.cy, r, conf, scoreCanon(comp.cx, comp.cy, r)))
             }
         }
-        return dets.sortedByDescending { it.conf }.take(11)
+
+        // Seed pass for leftovers
+        val suppress = BooleanArray(CANON * CANON)
+        for (d in raw) mark(suppress, d.x, d.y, er * 0.72f)
+        val smooth = FloatArray(CANON * CANON)
+        like.blurBox(CANON, CANON, max(2, (er * 0.14f).roundToInt()), smooth)
+        for (i in smooth.indices) {
+            if (suppress[i] || distMap[i] >= BLACK_R * 0.86f) smooth[i] = 0f
+        }
+        var guard = 0
+        while (raw.size < 11 && guard < 16) {
+            guard++
+            var bestI = -1
+            var bestV = 0f
+            for (i in smooth.indices) {
+                if (smooth[i] > bestV) {
+                    bestV = smooth[i]
+                    bestI = i
+                }
+            }
+            if (bestI < 0 || bestV < floor * 0.95f) break
+            var x = (bestI % CANON).toFloat()
+            var y = (bestI / CANON).toFloat()
+            // centroid refine
+            val rLoc = (er * 0.60f).roundToInt()
+            val x0 = max(0, x.roundToInt() - rLoc)
+            val x1 = min(CANON - 1, x.roundToInt() + rLoc)
+            val y0 = max(0, y.roundToInt() - rLoc)
+            val y1 = min(CANON - 1, y.roundToInt() + rLoc)
+            var wSum = 0.0
+            var sx = 0.0
+            var sy = 0.0
+            for (yy in y0..y1) for (xx in x0..x1) {
+                val v = like[yy * CANON + xx]
+                if (v >= bestV * 0.40f) {
+                    wSum += v
+                    sx += xx * v
+                    sy += yy * v
+                }
+            }
+            if (wSum > 1) {
+                x = (sx / wSum).toFloat()
+                y = (sy / wSum).toFloat()
+            }
+            val r = er * 0.95f
+            val (ok, conf) = validate(like, x, y, r, floor)
+            if (ok && conf >= 0.15f) {
+                raw.add(CanonShot(x, y, r, conf, scoreCanon(x, y, r)))
+                mark(suppress, x, y, er * 0.75f)
+                markZero(smooth, x, y, er * 0.75f)
+            } else {
+                markZero(smooth, x, y, er * 0.45f)
+            }
+        }
+
+        return raw
+            .filter { it.conf >= 0.14f && hypot(it.x - CANON / 2f, it.y - CANON / 2f) <= BLACK_R * 0.86f }
+            .sortedByDescending { it.conf }
+            .fold(ArrayList<CanonShot>()) { acc, d ->
+                if (acc.none { hypot(it.x - d.x, it.y - d.y) < er * 0.75f }) acc.add(d)
+                acc
+            }
+            .take(11)
+    }
+
+    private fun validate(like: FloatArray, x: Float, y: Float, r: Float, floor: Float): Pair<Boolean, Float> {
+        val x0 = max(0, (x - r).toInt())
+        val x1 = min(CANON - 1, (x + r).toInt())
+        val y0 = max(0, (y - r).toInt())
+        val y1 = min(CANON - 1, (y + r).toInt())
+        var sum = 0.0
+        var n = 0
+        var covN = 0
+        val r2 = (r * 0.60f) * (r * 0.60f)
+        for (yy in y0..y1) for (xx in x0..x1) {
+            val dx = xx - x
+            val dy = yy - y
+            if (dx * dx + dy * dy > r2) continue
+            val v = like[yy * CANON + xx]
+            sum += v
+            n++
+            if (v >= floor * 0.35f) covN++
+        }
+        if (n < 8) return false to 0f
+        val coreM = (sum / n).toFloat()
+        val cov = covN.toFloat() / n
+        val ok = coreM >= floor * 0.45f && cov >= 0.22f
+        val conf = min(coreM / 40f, 1f) * (0.4f + 0.6f * cov)
+        return ok to conf
     }
 
     private fun scoreCanon(x: Float, y: Float, r: Float): Int {
         val dist = max(0f, hypot(x - CANON / 2f, y - CANON / 2f) - r)
         val mm = dist * (23.5f / (2f * BLACK_R))
-        val diams = floatArrayOf(59.5f, 53.5f, 47.5f, 41.5f, 35.5f, 29.5f, 23.5f, 17.5f, 11.5f, 5.5f)
         for (score in 10 downTo 1) {
-            if (mm <= diams[score - 1] / 2f) return score
+            if (mm <= RING_DIAM_MM[score - 1] / 2f) return score
         }
         return 0
     }
 
     private data class Comp(
-        val area: Float, val cx: Float, val cy: Float, val meanLike: Float,
+        val area: Float, val cx: Float, val cy: Float,
         val minX: Int, val maxX: Int, val minY: Int, val maxY: Int,
         val pixels: BooleanArray
     )
@@ -289,27 +370,44 @@ object TemplatePipeline {
             for (x in 0 until CANON) {
                 val idx = y * CANON + x
                 if (!mask[idx] || labels[idx] != 0) continue
-                var head = 0; var tail = 0
-                qx[tail] = x; qy[tail] = y; tail++
+                var head = 0
+                var tail = 0
+                qx[tail] = x
+                qy[tail] = y
+                tail++
                 labels[idx] = next
-                var area = 0; var sx = 0.0; var sy = 0.0; var likeSum = 0.0
-                var x0 = x; var x1 = x; var y0 = y; var y1 = y
+                var area = 0
+                var sx = 0.0
+                var sy = 0.0
+                var x0 = x
+                var x1 = x
+                var y0 = y
+                var y1 = y
                 val pix = BooleanArray(CANON * CANON)
                 while (head < tail) {
-                    val cx = qx[head]; val cy = qy[head]; head++
-                    area++; sx += cx; sy += cy
+                    val cx = qx[head]
+                    val cy = qy[head]
+                    head++
+                    area++
+                    sx += cx
+                    sy += cy
                     val p = cy * CANON + cx
-                    likeSum += like[p]; pix[p] = true
-                    x0 = min(x0, cx); x1 = max(x1, cx)
-                    y0 = min(y0, cy); y1 = max(y1, cy)
+                    pix[p] = true
+                    x0 = min(x0, cx)
+                    x1 = max(x1, cx)
+                    y0 = min(y0, cy)
+                    y1 = max(y1, cy)
                     for (dy in -1..1) for (dx in -1..1) {
                         if (dx == 0 && dy == 0) continue
-                        val nx = cx + dx; val ny = cy + dy
+                        val nx = cx + dx
+                        val ny = cy + dy
                         if (nx !in 0 until CANON || ny !in 0 until CANON) continue
                         val nIdx = ny * CANON + nx
                         if (mask[nIdx] && labels[nIdx] == 0) {
                             labels[nIdx] = next
-                            qx[tail] = nx; qy[tail] = ny; tail++
+                            qx[tail] = nx
+                            qy[tail] = ny
+                            tail++
                         }
                     }
                 }
@@ -317,7 +415,7 @@ object TemplatePipeline {
                 out.add(
                     Comp(
                         area.toFloat(), (sx / area).toFloat(), (sy / area).toFloat(),
-                        (likeSum / area).toFloat(), x0, x1, y0, y1, pix
+                        x0, x1, y0, y1, pix
                     )
                 )
             }
@@ -326,7 +424,8 @@ object TemplatePipeline {
     }
 
     private fun distanceTransform(mask: BooleanArray): FloatArray {
-        val w = CANON; val h = CANON
+        val w = CANON
+        val h = CANON
         val inf = 1e8f
         val dist = FloatArray(w * h) { if (mask[it]) inf else 0f }
         for (y in 0 until h) {
@@ -344,14 +443,20 @@ object TemplatePipeline {
             parabola[1] = Float.POSITIVE_INFINITY
             fun f(y: Int) = dist[y * w + x]
             fun sep(i: Int, u: Int): Float {
-                val di = f(i); val du = f(u)
+                val di = f(i)
+                val du = f(u)
                 return ((u * u - i * i + du * du - di * di) / (2f * (u - i)))
             }
             for (q in 1 until h) {
                 var s = sep(envelope[k], q)
-                while (k > 0 && s <= parabola[k]) { k--; s = sep(envelope[k], q) }
+                while (k > 0 && s <= parabola[k]) {
+                    k--
+                    s = sep(envelope[k], q)
+                }
                 k++
-                envelope[k] = q; parabola[k] = s; parabola[k + 1] = Float.POSITIVE_INFINITY
+                envelope[k] = q
+                parabola[k] = s
+                parabola[k + 1] = Float.POSITIVE_INFINITY
             }
             k = 0
             for (q in 0 until h) {
@@ -365,11 +470,14 @@ object TemplatePipeline {
     }
 
     private fun localMaxima(
-        dist: FloatArray, minR: Float, maxR: Float, er: Float
+        dist: FloatArray,
+        minR: Float,
+        maxR: Float,
+        er: Float
     ): List<Triple<Float, Float, Float>> {
         val peaks = ArrayList<Triple<Float, Float, Float>>()
-        val n = max(2, (er * 0.55f).roundToInt())
-        val minPeak = minR * 0.75f
+        val n = max(2, (er * 0.48f).roundToInt())
+        val minPeak = minR * 0.60f
         for (y in n until CANON - n) {
             for (x in n until CANON - n) {
                 val v = dist[y * CANON + x]
@@ -377,7 +485,10 @@ object TemplatePipeline {
                 var isMax = true
                 outer@ for (dy in -n..n) for (dx in -n..n) {
                     if (dx == 0 && dy == 0) continue
-                    if (dist[(y + dy) * CANON + (x + dx)] > v) { isMax = false; break@outer }
+                    if (dist[(y + dy) * CANON + (x + dx)] > v) {
+                        isMax = false
+                        break@outer
+                    }
                 }
                 if (isMax) peaks.add(Triple(x.toFloat(), y.toFloat(), v))
             }
@@ -385,26 +496,31 @@ object TemplatePipeline {
         return peaks
     }
 
-    private fun occupiedNear(occupied: BooleanArray, cx: Float, cy: Float, er: Float): Boolean {
-        val r = er.roundToInt().coerceAtLeast(1)
-        val x0 = max(0, cx.roundToInt() - r); val x1 = min(CANON - 1, cx.roundToInt() + r)
-        val y0 = max(0, cy.roundToInt() - r); val y1 = min(CANON - 1, cy.roundToInt() + r)
-        val r2 = er * er
-        for (y in y0..y1) for (x in x0..x1) {
-            val dx = x - cx; val dy = y - cy
-            if (dx * dx + dy * dy <= r2 && occupied[y * CANON + x]) return true
-        }
-        return false
-    }
-
     private fun mark(occupied: BooleanArray, cx: Float, cy: Float, radius: Float) {
         val r = radius.roundToInt().coerceAtLeast(1)
-        val x0 = max(0, cx.roundToInt() - r); val x1 = min(CANON - 1, cx.roundToInt() + r)
-        val y0 = max(0, cy.roundToInt() - r); val y1 = min(CANON - 1, cy.roundToInt() + r)
+        val x0 = max(0, cx.roundToInt() - r)
+        val x1 = min(CANON - 1, cx.roundToInt() + r)
+        val y0 = max(0, cy.roundToInt() - r)
+        val y1 = min(CANON - 1, cy.roundToInt() + r)
         val r2 = radius * radius
         for (y in y0..y1) for (x in x0..x1) {
-            val dx = x - cx; val dy = y - cy
+            val dx = x - cx
+            val dy = y - cy
             if (dx * dx + dy * dy <= r2) occupied[y * CANON + x] = true
+        }
+    }
+
+    private fun markZero(arr: FloatArray, cx: Float, cy: Float, radius: Float) {
+        val r = radius.roundToInt().coerceAtLeast(1)
+        val x0 = max(0, cx.roundToInt() - r)
+        val x1 = min(CANON - 1, cx.roundToInt() + r)
+        val y0 = max(0, cy.roundToInt() - r)
+        val y1 = min(CANON - 1, cy.roundToInt() + r)
+        val r2 = radius * radius
+        for (y in y0..y1) for (x in x0..x1) {
+            val dx = x - cx
+            val dy = y - cy
+            if (dx * dx + dy * dy <= r2) arr[y * CANON + x] = 0f
         }
     }
 }
