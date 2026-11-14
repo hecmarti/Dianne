@@ -121,4 +121,71 @@ internal object Morphology {
 
     fun closeBool(mask: BooleanArray, w: Int, h: Int, radius: Int): BooleanArray =
         erodeBool(dilateBool(mask, w, h, radius), w, h, radius)
+
+    /** Fast separable box dilate (approx disk). Prefer this on 512²+ masks. */
+    fun dilateBoolBox(mask: BooleanArray, w: Int, h: Int, radius: Int): BooleanArray {
+        if (radius <= 0) return mask.copyOf()
+        val temp = BooleanArray(mask.size)
+        val out = BooleanArray(mask.size)
+        for (y in 0 until h) {
+            val row = y * w
+            for (x in 0 until w) {
+                var any = false
+                val x0 = max(0, x - radius)
+                val x1 = min(w - 1, x + radius)
+                for (xx in x0..x1) {
+                    if (mask[row + xx]) { any = true; break }
+                }
+                temp[row + x] = any
+            }
+        }
+        for (x in 0 until w) {
+            for (y in 0 until h) {
+                var any = false
+                val y0 = max(0, y - radius)
+                val y1 = min(h - 1, y + radius)
+                for (yy in y0..y1) {
+                    if (temp[yy * w + x]) { any = true; break }
+                }
+                out[y * w + x] = any
+            }
+        }
+        return out
+    }
+
+    fun erodeBoolBox(mask: BooleanArray, w: Int, h: Int, radius: Int): BooleanArray {
+        if (radius <= 0) return mask.copyOf()
+        val temp = BooleanArray(mask.size)
+        val out = BooleanArray(mask.size)
+        for (y in 0 until h) {
+            val row = y * w
+            for (x in 0 until w) {
+                var all = true
+                val x0 = max(0, x - radius)
+                val x1 = min(w - 1, x + radius)
+                for (xx in x0..x1) {
+                    if (!mask[row + xx]) { all = false; break }
+                }
+                temp[row + x] = all
+            }
+        }
+        for (x in 0 until w) {
+            for (y in 0 until h) {
+                var all = true
+                val y0 = max(0, y - radius)
+                val y1 = min(h - 1, y + radius)
+                for (yy in y0..y1) {
+                    if (!temp[yy * w + x]) { all = false; break }
+                }
+                out[y * w + x] = all
+            }
+        }
+        return out
+    }
+
+    fun closeBoolFast(mask: BooleanArray, w: Int, h: Int, radius: Int): BooleanArray =
+        erodeBoolBox(dilateBoolBox(mask, w, h, radius), w, h, radius)
+
+    fun openBoolFast(mask: BooleanArray, w: Int, h: Int, radius: Int): BooleanArray =
+        dilateBoolBox(erodeBoolBox(mask, w, h, radius), w, h, radius)
 }

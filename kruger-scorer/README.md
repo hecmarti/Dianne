@@ -46,20 +46,22 @@ cd kruger-scorer
 
 ## Reconocimiento (fotos reales)
 
-El detector se afinó con 5 fotos reales de dianas Krüger y se verificó con una sexta foto **no usada en el ajuste** (holdout).
+Pipeline por **superposición de plantilla** (mismas dianas Krüger):
 
-- Calibración del círculo negro por contraste interior/exterior + refinamiento radial
-- Huecos: brillo absoluto + white top-hat dentro del negro (≈7% del radio negro)
-- Clusters unidos: distance transform
-- El umbral y los taps manuales siguen siendo la red de seguridad cuando hay solapes difíciles
+1. Calibrar el círculo negro y warp a un marco canónico (negro = radio fijo).
+2. Comparar con un disco negro ideal → residuales = huecos / diferencias.
+3. Filtrar ruido; cierre morfológico para completar círculos rotos; distance transform para separar clusters.
+4. Puntuar en el marco canónico (ISSF 10 m aire) y proyectar al overlay.
+
+Afinado con un lote de fotos de móvil; holdout aparte. El umbral y los taps manuales siguen siendo la red de seguridad.
 
 ## Arquitectura
 
 | Pieza | Rol |
 |-------|-----|
 | `vision/TargetCalibrator` | Localiza el círculo negro (anillo 7) |
-| `vision/HoleDetector` | Contraste local + opening + distance transform (separa impactos unidos) |
-| `vision/ScoreMapper` | Radios ISSF 10 m aire relativos al negro |
+| `vision/TemplatePipeline` | Warp canónico + diferencia vs plantilla + cierre/split |
+| `vision/DetectionPipeline` | Orquesta el análisis para la UI |
 | UI Compose | Home → revisión con overlay interactivo |
 
 Sin OpenCV ni modelos ML: el APK se mantiene ligero y la instalación es directa.

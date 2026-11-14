@@ -3,9 +3,10 @@ package com.dianne.krugerscorer.vision
 import android.graphics.Bitmap
 import com.dianne.krugerscorer.model.AnalysisResult
 import com.dianne.krugerscorer.model.ShotDetection
+import kotlin.math.sqrt
 
 /**
- * End-to-end analysis: calibrate Krüger target → detect holes → score.
+ * End-to-end analysis via template superposition (canonical Kruger frame).
  */
 object DetectionPipeline {
 
@@ -15,21 +16,8 @@ object DetectionPipeline {
     )
 
     fun analyze(source: Bitmap, sensitivity: Float): Output {
-        val (buffer, working) = ImageBuffer.fromBitmap(source)
-        val calibration = TargetCalibrator.calibrate(buffer)
-        val detections = if (calibration != null) {
-            HoleDetector.detect(buffer, calibration, sensitivity)
-        } else {
-            emptyList()
-        }
-        return Output(
-            result = AnalysisResult(
-                calibration = calibration,
-                detections = detections,
-                sensitivity = sensitivity
-            ),
-            workingBitmap = working
-        )
+        val out = TemplatePipeline.analyze(source, sensitivity)
+        return Output(out.result, out.workingBitmap)
     }
 
     fun reanalyzeKeepingToggles(
@@ -39,8 +27,6 @@ object DetectionPipeline {
     ): Output {
         val output = analyze(source, sensitivity)
         if (previous.isEmpty()) return output
-
-        // Preserve user toggles when a new detection lands near an old one.
         val merged = output.result.detections.map { neu ->
             val match = previous.minByOrNull { old ->
                 val dx = old.x - neu.x
@@ -50,9 +36,9 @@ object DetectionPipeline {
             val dist = match?.let {
                 val dx = it.x - neu.x
                 val dy = it.y - neu.y
-                kotlin.math.sqrt(dx * dx + dy * dy)
+                sqrt(dx * dx + dy * dy)
             } ?: Float.MAX_VALUE
-            if (match != null && dist < neu.radius * 1.2f) {
+            if (match != null && dist < neu.radius * 1.3f) {
                 neu.copy(enabled = match.enabled)
             } else {
                 neu
