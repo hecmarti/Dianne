@@ -25,7 +25,7 @@ class ImageBuffer private constructor(
     }
 
     companion object {
-        fun fromBitmap(source: Bitmap, maxSide: Int = 1024): Pair<ImageBuffer, Bitmap> {
+        fun fromBitmap(source: Bitmap, maxSide: Int = 900): Pair<ImageBuffer, Bitmap> {
             val scaled = scaleDown(source, maxSide)
             val w = scaled.width
             val h = scaled.height

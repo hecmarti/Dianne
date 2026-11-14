@@ -2,19 +2,19 @@ package com.dianne.krugerscorer.vision
 
 import com.dianne.krugerscorer.model.TargetCalibration
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
  * Locates the black aiming mark on a Krüger airgun target.
  *
- * Strategy:
- * 1. Threshold dark pixels.
- * 2. Find the largest roughly-circular dark blob near the image center.
- * 3. Refine center/radius with radial sampling of the gray profile.
+ * Candidates come from dark connected components; each is scored by
+ * interior/exterior contrast, then refined with radial dark→light edges.
  */
 object TargetCalibrator {
 
@@ -27,40 +27,87 @@ object TargetCalibrator {
             mask[i] = image.gray[i] < threshold
         }
 
-        val labels = IntArray(w * h)
-        val components = connectedComponents(mask, w, h, labels)
+        val components = connectedComponents(mask, w, h)
         if (components.isEmpty()) return null
 
         val cxImg = w / 2f
         val cyImg = h / 2f
-        val best = components
-            .asSequence()
-            .filter { it.area in (w * h / 80)..(w * h / 2) }
-            .map { comp ->
-                val dx = comp.cx - cxImg
-                val dy = comp.cy - cyImg
-                val dist = hypot(dx, dy)
-                val circularity = circularity(comp)
-                Triple(comp, circularity, dist)
-            }
-            .filter { it.second > 0.55f }
-            .minByOrNull { it.third }
-            ?.first
-            ?: components.maxByOrNull { it.area }
-            ?: return null
+        data class Cand(val score: Float, val cx: Float, val cy: Float, val r: Float)
 
-        val refined = refineCircle(image, best.cx, best.cy, best.radius)
-        return TargetCalibration(
-            centerX = refined.first,
-            centerY = refined.second,
-            blackRadius = refined.third,
-            imageWidth = w,
-            imageHeight = h
-        )
+        val cands = ArrayList<Cand>()
+        for (comp in components) {
+            if (comp.area !in (w * h / 16)..(w * h * 7 / 10)) continue
+            val circularity = circularity(comp)
+            if (circularity < 0.55f) continue
+            val q = circleQuality(image, comp.cx, comp.cy, comp.radius) + circularity * 15f
+            val centerPen = 0.015f * hypot(comp.cx - cxImg, comp.cy - cyImg)
+            cands.add(Cand(q - centerPen, comp.cx, comp.cy, comp.radius))
+        }
+        if (cands.isEmpty()) {
+            val largest = components.maxByOrNull { it.area } ?: return null
+            cands.add(Cand(0f, largest.cx, largest.cy, largest.radius))
+        }
+        cands.sortByDescending { it.score }
+        var cx = cands[0].cx
+        var cy = cands[0].cy
+        var r = cands[0].r
+
+        repeat(5) {
+            val edges = sampleEdgePoints(image, cx, cy, r)
+            if (edges.size < 28) return@repeat
+            val rr = edges.map { hypot(it.first - cx, it.second - cy) }
+            val med = rr.sorted()[rr.size / 2]
+            val mad = rr.map { abs(it - med) }.sorted()[rr.size / 2] + 1e-3f
+            val filtered = edges.filterIndexed { i, _ -> abs(rr[i] - med) < 2.2f * mad }
+            if (filtered.size < 24) return@repeat
+            val fitted = fitCircle(filtered)
+            if (fitted != null) {
+                cx = fitted.first
+                cy = fitted.second
+                r = fitted.third
+            } else {
+                cx = filtered.map { it.first }.average().toFloat()
+                cy = filtered.map { it.second }.average().toFloat()
+                r = filtered.map { hypot(it.first - cx, it.second - cy) }.average().toFloat()
+            }
+        }
+
+        if (r < min(w, h) * 0.12f) return null
+        return TargetCalibration(cx, cy, r, w, h)
+    }
+
+    private fun circleQuality(image: ImageBuffer, cx: Float, cy: Float, r: Float): Float {
+        var inSum = 0.0
+        var inN = 0
+        var outSum = 0.0
+        var outN = 0
+        var darkN = 0
+        val step = max(1, (r / 40f).roundToInt())
+        var y = 0
+        while (y < image.height) {
+            var x = 0
+            while (x < image.width) {
+                val d = hypot(x - cx, y - cy)
+                val v = image.get(x, y)
+                if (d <= r * 0.82f) {
+                    inSum += v
+                    inN++
+                    if (v < 70f) darkN++
+                } else if (d in (r * 1.04f)..(r * 1.22f)) {
+                    outSum += v
+                    outN++
+                }
+                x += step
+            }
+            y += step
+        }
+        if (inN < 40 || outN < 20) return -1e6f
+        val contrast = (outSum / outN - inSum / inN).toFloat()
+        val darkFrac = darkN.toFloat() / inN
+        return contrast + 40f * darkFrac
     }
 
     private fun estimateDarkThreshold(image: ImageBuffer): Float {
-        // Otsu-ish: mean of the darker half of a subsampled histogram.
         val hist = IntArray(256)
         var i = 0
         while (i < image.gray.size) {
@@ -88,13 +135,22 @@ object TargetCalibrator {
                 threshold = t
             }
         }
-        // Keep threshold close to Otsu so cream paper stays out of the mask.
-        // A large positive bias merges logos and outer rings into the aiming mark.
-        return (threshold + 6).coerceIn(35, 110).toFloat()
+        // Also consider low percentile — close-ups are mostly black ink.
+        var cum = 0
+        var p28 = 40
+        val target = (total * 0.28).toInt()
+        for (t in 0..255) {
+            cum += hist[t]
+            if (cum >= target) {
+                p28 = t
+                break
+            }
+        }
+        val thr = min(threshold + 4, p28 + 8)
+        return thr.coerceIn(28, 95).toFloat()
     }
 
     private data class Component(
-        val label: Int,
         val area: Int,
         val cx: Float,
         val cy: Float,
@@ -105,36 +161,22 @@ object TargetCalibrator {
         val maxY: Int
     )
 
-    private fun connectedComponents(
-        mask: BooleanArray,
-        w: Int,
-        h: Int,
-        labels: IntArray
-    ): List<Component> {
-        labels.fill(0)
+    private fun connectedComponents(mask: BooleanArray, w: Int, h: Int): List<Component> {
+        val labels = IntArray(w * h)
         var next = 1
-        val areas = mutableListOf<Int>()
-        val sumX = mutableListOf<Long>()
-        val sumY = mutableListOf<Long>()
-        val minX = mutableListOf<Int>()
-        val maxX = mutableListOf<Int>()
-        val minY = mutableListOf<Int>()
-        val maxY = mutableListOf<Int>()
-
+        val out = ArrayList<Component>()
         val qx = IntArray(w * h)
         val qy = IntArray(w * h)
-
         for (y in 0 until h) {
             for (x in 0 until w) {
                 val idx = y * w + x
                 if (!mask[idx] || labels[idx] != 0) continue
-                val label = next++
                 var head = 0
                 var tail = 0
                 qx[tail] = x
                 qy[tail] = y
                 tail++
-                labels[idx] = label
+                labels[idx] = next
                 var area = 0
                 var sx = 0L
                 var sy = 0L
@@ -161,7 +203,7 @@ object TargetCalibrator {
                             if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue
                             val nIdx = ny * w + nx
                             if (mask[nIdx] && labels[nIdx] == 0) {
-                                labels[nIdx] = label
+                                labels[nIdx] = next
                                 qx[tail] = nx
                                 qy[tail] = ny
                                 tail++
@@ -169,35 +211,22 @@ object TargetCalibrator {
                         }
                     }
                 }
-                areas.add(area)
-                sumX.add(sx)
-                sumY.add(sy)
-                minX.add(x0)
-                maxX.add(x1)
-                minY.add(y0)
-                maxY.add(y1)
+                next++
+                out.add(
+                    Component(
+                        area = area,
+                        cx = sx.toFloat() / area,
+                        cy = sy.toFloat() / area,
+                        radius = sqrt(area / Math.PI.toFloat()),
+                        minX = x0,
+                        maxX = x1,
+                        minY = y0,
+                        maxY = y1
+                    )
+                )
             }
         }
-
-        return areas.indices.map { i ->
-            val area = areas[i]
-            val cx = sumX[i].toFloat() / area
-            val cy = sumY[i].toFloat() / area
-            // Area-derived radius is more robust than the bounding box when
-            // thresholding spills into logos / outer rings.
-            val radius = sqrt(area / Math.PI.toFloat())
-            Component(
-                label = i + 1,
-                area = area,
-                cx = cx,
-                cy = cy,
-                radius = radius,
-                minX = minX[i],
-                maxX = maxX[i],
-                minY = minY[i],
-                maxY = maxY[i]
-            )
-        }
+        return out
     }
 
     private fun circularity(comp: Component): Float {
@@ -210,60 +239,42 @@ object TargetCalibrator {
         return aspect * 0.55f + fillScore * 0.45f
     }
 
-    private fun refineCircle(
-        image: ImageBuffer,
-        seedX: Float,
-        seedY: Float,
-        seedR: Float
-    ): Triple<Float, Float, Float> {
-        var cx = seedX
-        var cy = seedY
-        var r = seedR
-        repeat(3) {
-            val edges = sampleEdgePoints(image, cx, cy, r)
-            if (edges.size < 12) return Triple(cx, cy, r)
-            val fitted = fitCircle(edges) ?: return Triple(cx, cy, r)
-            cx = fitted.first
-            cy = fitted.second
-            r = fitted.third
-        }
-        return Triple(cx, cy, r)
-    }
-
     private fun sampleEdgePoints(
         image: ImageBuffer,
         cx: Float,
         cy: Float,
         seedR: Float
     ): List<Pair<Float, Float>> {
-        val points = ArrayList<Pair<Float, Float>>(72)
-        val searchMin = (seedR * 0.55f).coerceAtLeast(8f)
+        val points = ArrayList<Pair<Float, Float>>(180)
+        val searchMin = (seedR * 0.55f).coerceAtLeast(6f)
         val searchMax = (seedR * 1.45f).coerceAtMost(
-            min(image.width, image.height) / 2f - 2f
+            min(
+                min(cx, image.width - cx),
+                min(cy, image.height - cy)
+            ) - 2f
         )
-        val steps = 72
-        for (i in 0 until steps) {
-            val angle = (Math.PI * 2.0 * i / steps).toFloat()
-            val cos = kotlin.math.cos(angle)
-            val sin = kotlin.math.sin(angle)
+        if (searchMax <= searchMin) return points
+        for (i in 0 until 180) {
+            val angle = (Math.PI * 2.0 * i / 180).toFloat()
+            val c = cos(angle)
+            val s = sin(angle)
             var bestT = seedR
             var bestGrad = 0f
             var t = searchMin
-            var prev = sampleBilinear(image, cx + cos * t, cy + sin * t)
-            t += 1.5f
+            var prev = sampleBilinear(image, cx + c * t, cy + s * t)
+            t += 0.7f
             while (t <= searchMax) {
-                val v = sampleBilinear(image, cx + cos * t, cy + sin * t)
+                val v = sampleBilinear(image, cx + c * t, cy + s * t)
                 val grad = v - prev
-                // Dark→light transition at the black mark boundary.
                 if (grad > bestGrad) {
                     bestGrad = grad
-                    bestT = t - 0.75f
+                    bestT = t - 0.35f
                 }
                 prev = v
-                t += 1.5f
+                t += 0.7f
             }
-            if (bestGrad > 8f) {
-                points.add(cx + cos * bestT to cy + sin * bestT)
+            if (bestGrad > 3f) {
+                points.add(cx + c * bestT to cy + s * bestT)
             }
         }
         return points
@@ -287,7 +298,6 @@ object TargetCalibrator {
     }
 
     private fun fitCircle(points: List<Pair<Float, Float>>): Triple<Float, Float, Float>? {
-        // Algebraic circle fit (Kåsa).
         var sumX = 0.0
         var sumY = 0.0
         var sumX2 = 0.0

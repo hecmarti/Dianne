@@ -43,6 +43,16 @@ cd kruger-scorer
 # APK en app/build/outputs/apk/debug/app-debug.apk
 ```
 
+
+## Reconocimiento (fotos reales)
+
+El detector se afinó con 5 fotos reales de dianas Krüger y se verificó con una sexta foto **no usada en el ajuste** (holdout).
+
+- Calibración del círculo negro por contraste interior/exterior + refinamiento radial
+- Huecos: brillo absoluto + white top-hat dentro del negro (≈7% del radio negro)
+- Clusters unidos: distance transform
+- El umbral y los taps manuales siguen siendo la red de seguridad cuando hay solapes difíciles
+
 ## Arquitectura
 
 | Pieza | Rol |
