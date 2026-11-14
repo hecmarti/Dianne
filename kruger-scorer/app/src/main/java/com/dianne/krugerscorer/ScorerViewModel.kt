@@ -133,7 +133,7 @@ class ScorerViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update {
                     it.copy(
                         analyzing = false,
-                        error = e.message ?: "Error al analizar"
+                        error = "No se pudo analizar la imagen. Prueba otra foto más frontal y con buena luz."
                     )
                 }
             }

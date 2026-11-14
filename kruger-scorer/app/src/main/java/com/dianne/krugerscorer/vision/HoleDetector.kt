@@ -266,8 +266,9 @@ object HoleDetector {
         }
 
         val out = FloatArray(w * h)
-        val envelope = IntArray(h)
-        val parabola = FloatArray(h)
+        // Meijster lower envelope needs one sentinel past the last site (index h).
+        val envelope = IntArray(h + 1)
+        val parabola = FloatArray(h + 1)
         for (x in 0 until w) {
             var k = 0
             envelope[0] = 0
@@ -281,7 +282,7 @@ object HoleDetector {
             }
             for (q in 1 until h) {
                 var s = sep(envelope[k], q)
-                while (s <= parabola[k]) {
+                while (k > 0 && s <= parabola[k]) {
                     k--
                     s = sep(envelope[k], q)
                 }
@@ -292,7 +293,7 @@ object HoleDetector {
             }
             k = 0
             for (q in 0 until h) {
-                while (parabola[k + 1] < q) k++
+                while (k < h && parabola[k + 1] < q) k++
                 val p = envelope[k]
                 val d = (q - p) * (q - p) + f(p) * f(p)
                 out[q * w + x] = if (!mask[q * w + x]) 0f else sqrt(d)
