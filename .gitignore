@@ -1,0 +1,14 @@
+**/.gradle/
+**/build/
+**/local.properties
+**/.idea/
+*.iml
+.DS_Store
+
+# Local reference only — never commit
+App Tiro v2/
+"App Tiro v2"/
+
+# Local detector test outputs
+kruger-scorer/scripts/out_pistol/
+kruger-scorer/scripts/__pycache__/
