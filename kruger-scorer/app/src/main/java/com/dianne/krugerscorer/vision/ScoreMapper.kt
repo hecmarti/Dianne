@@ -4,44 +4,27 @@ import com.dianne.krugerscorer.model.TargetCalibration
 import kotlin.math.hypot
 
 /**
- * Maps a hole position to an ISSF-style ring score.
+ * Maps a hole to an ISSF 10 m air-pistol ring score.
  *
- * On Krüger airgun training targets the black aiming mark covers rings 7–10.
- * We treat [TargetCalibration.blackRadius] as the outer edge of ring 7 and
- * scale the remaining rings with the official relative diameters.
- *
- * Scoring uses the edge of the hole nearest the center (ISSF: the shot
- * receives the highest value of any scoring zone it touches).
+ * Black aiming mark = outer edge of ring 7 = 29.75 mm radius.
+ * Score uses the edge of the hole nearest the center (hole touches the zone).
  */
 object ScoreMapper {
 
-    // Outer diameters (mm) for 10m air rifle, relative to ring-7 outer diameter 23.5 mm.
-    // Black aiming mark on many printed Krüger cards aligns with ring 7.
-    private val ringOuterDiameterMm = floatArrayOf(
-        59.5f, // 1
-        53.5f, // 2
-        47.5f, // 3
-        41.5f, // 4
-        35.5f, // 5
-        29.5f, // 6
-        23.5f, // 7  ← black outer
-        17.5f, // 8
-        11.5f, // 9
-        5.5f   // 10
-    )
-
-    private const val RING7_DIAMETER_MM = 23.5f
+    private const val HOLE_R_MM = 2.25f
+    private const val BLACK_R_MM = 29.75f
+    /** Outer radii (mm) for scores 10..7. */
+    private val ringRadiusMm = floatArrayOf(5.75f, 13.75f, 21.75f, 29.75f)
 
     fun score(calibration: TargetCalibration, x: Float, y: Float, radius: Float): Int {
-        val distCenter = hypot(x - calibration.centerX, y - calibration.centerY)
-        // Edge closest to the bullseye.
-        val scoringDistance = (distCenter - radius).coerceAtLeast(0f)
-        val mmPerPx = RING7_DIAMETER_MM / (2f * calibration.blackRadius)
-        val distMm = scoringDistance * mmPerPx
-        for (score in 10 downTo 1) {
-            val outerRadiusMm = ringOuterDiameterMm[score - 1] / 2f
-            if (distMm <= outerRadiusMm) return score
+        val distPx = hypot(x - calibration.centerX, y - calibration.centerY)
+        val mmPerPx = BLACK_R_MM / calibration.blackRadius
+        // Distance of hole center in mm (scoring uses center + pellet rule via HOLE_R)
+        val dMm = distPx * mmPerPx
+        for (i in ringRadiusMm.indices) {
+            val s = 10 - i
+            if (dMm <= ringRadiusMm[i] + HOLE_R_MM) return s
         }
-        return 0
+        return 6
     }
 }

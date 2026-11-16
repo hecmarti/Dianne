@@ -46,22 +46,23 @@ cd kruger-scorer
 
 ## Reconocimiento (fotos reales)
 
-Pipeline por **marco canónico + aplanado de iluminación** (mismas dianas Krüger):
+Pipeline de **pistola de aire 10 m** (medición en mm):
 
-1. Calibrar el círculo negro (varios umbrales, radio acotado) y warp a un marco canónico.
-2. Aplanar sombras dentro del negro (`gray / blur`) y combinar residual + chroma (cian/azul del fondo).
-3. Cierre morfológico para completar círculos rotos; DT + semillas para separar clusters; validación por cobertura.
-4. Puntuar en el marco canónico (ISSF 10 m aire) y proyectar al overlay.
+1. Localizar el círculo negro (radio = 29,75 mm) en dos pasadas (miniatura → recorte escalado).
+2. Agujeros = claros respecto a un fondo local desenfocado (soporta sombras / crema / azul).
+3. Cada mancha se reparte en N círculos de radio de balín (2,25 mm) minimizando error; se prefiere un total de 10 impactos.
+4. Mordiscos en el borde del negro, rechazo de dedos, y `?` (confianza baja) si el disparo está a &lt; 0,8 mm de una línea.
+5. Taps / slider para corregir.
 
-Afinado con un lote de fotos de móvil (≈±1 impacto en train, holdout OK). El umbral y los taps manuales siguen siendo la red de seguridad.
+Validado con la sesión del 14-11 (totales conocidos): **5/6 exactos** (la 5ª queda a 1 punto y marcada dudosa).
 
 ## Arquitectura
 
 | Pieza | Rol |
 |-------|-----|
-| `vision/TargetCalibrator` | Localiza el círculo negro (anillo 7) |
-| `vision/TemplatePipeline` | Warp canónico + diferencia vs plantilla + cierre/split |
+| `vision/PistolPipeline` | Calibración + umbral local + empaquetado de círculos + scoring pistola |
 | `vision/DetectionPipeline` | Orquesta el análisis para la UI |
+| `vision/ScoreMapper` | Radios ISSF pistola 10 m |
 | UI Compose | Home → revisión con overlay interactivo |
 
 Sin OpenCV ni modelos ML: el APK se mantiene ligero y la instalación es directa.

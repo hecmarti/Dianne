@@ -6,18 +6,19 @@ import com.dianne.krugerscorer.model.ShotDetection
 import kotlin.math.sqrt
 
 /**
- * End-to-end analysis via template superposition (canonical Kruger frame).
+ * End-to-end analysis for 10 m air-pistol Krüger targets.
  */
 object DetectionPipeline {
 
     data class Output(
         val result: AnalysisResult,
-        val workingBitmap: Bitmap
+        val workingBitmap: Bitmap,
+        val avisos: List<String> = emptyList()
     )
 
     fun analyze(source: Bitmap, sensitivity: Float): Output {
-        val out = TemplatePipeline.analyze(source, sensitivity)
-        return Output(out.result, out.workingBitmap)
+        val out = PistolPipeline.analyze(source, sensitivity)
+        return Output(out.result, out.workingBitmap, out.avisos)
     }
 
     fun reanalyzeKeepingToggles(
